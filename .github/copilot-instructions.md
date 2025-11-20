@@ -76,7 +76,7 @@
 Cuando el diff sugiera **cambios de estructura de datos**, **siempre proponer** un **script de migración** en la carpeta `migrations/`, usando pre/post/end según corresponda (ver mapeo más abajo) **y recordar el bump de versión**.
 Ejemplos de cambios estructurales:
 
-* Carpeta dentro de `migrations/` debe ser la versión correspondiente en el manifest (e.g. `migrations/18.0.5.0/`).
+* Carpeta dentro de `migrations/` debe ser la versión correspondiente en el manifest (e.g. `migrations/19.0.5.0/`).
 * Renombrar campos o modelos.
 * Cambiar tipos de campo (e.g. `Char → Many2one`, `Selection → Many2one`, etc.).
 * Quitar campos para reestructurar información en otros (split/merge).
