@@ -19,6 +19,24 @@ class AccountPayment(models.Model):
         for rec in self:
             rec.duplicate_payment_ids = False
 
+    @api.model_create_multi
+    def create(self, vals_list):
+        for vals in vals_list:
+            # PARCHE ODOO 19: Limpieza preventiva de campos de compatibilidad
+            # Los eliminamos de vals para que no explote el super().create() 
+            # si el esquema de la DB o el registro no están sincronizados.
+            fields_to_pop = [
+                'counterpart_currency_id', 
+                'bundle_counterpart_currency_amount',
+                'duplicate_payment_ids',
+                'l10n_latam_check_warning_msg',
+                'counterpart_exchange_rate',
+                'payment_difference'
+            ]
+            for field in fields_to_pop:
+                vals.pop(field, None)
+        return super().create(vals_list)
+
 
     def action_post(self):
         """Odoo a partir de 16, cuando se valida un pago con token, si la transaccion no queda en done cancela el pago
