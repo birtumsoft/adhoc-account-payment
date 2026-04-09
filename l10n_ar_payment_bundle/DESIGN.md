@@ -20,7 +20,7 @@ The main payment defines the cancellation currency (B) via `counterpart_currency
 Same tri-currency model as `account_payment_pro`:
 
 | Symbol | Field | In the bundle |
-|--------|-------|--------------|
+| --- | --- | --- |
 | **A** | `currency_id` | Journal currency of each payment. Can differ between main and linked. |
 | **B** | `destination_currency_id` | Cancellation currency. Defined by main, inherited by all linked. |
 | **C** | `company_currency_id` | ARS. Same for all. |

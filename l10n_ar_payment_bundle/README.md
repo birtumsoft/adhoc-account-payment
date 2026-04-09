@@ -18,7 +18,7 @@ Groups multiple payments into a single "bundle receipt": a main payment (`is_mai
 ## Dependencies
 
 | Module | Purpose |
-|--------|---------|
+| --- | --- |
 | `account_payment_pro` | Tri-currency payment model |
 | `l10n_ar_tax` | Argentine withholdings |
 | `account_payment_pro_receiptbook` | Receipt book management |
