@@ -34,20 +34,43 @@ class l10nLatamAccountPaymentCheck(models.Model):
         for rec in self:
             rec.user_can_write = rec.env.user.has_group("account.group_account_user")
 
-    @api.depends("operation_ids.state", "payment_id.state")
+    # Both computes below resolve the last operation of the chain, and that order comes from the
+    # operation date. The core depends only on the states, so fixing the date of an operation --a
+    # migration script, an import, a manual correction-- reordered the chain but left these stored
+    # fields with the old value, and the check kept showing in the portfolio after it was handed
+    # over. Adding a depends does not recompute the existing records, so installing this does not
+    # move checks that are fine today.
+    @api.depends(
+        "operation_ids.state",
+        "payment_id.state",
+    )
     def _compute_company_id(self):
         for rec in self:
             last_operation = rec._get_last_operation() or rec.payment_id
             rec.company_id = last_operation.company_id
 
+    @api.depends(
+        "operation_ids.state",
+        "payment_id.state",
+        "operation_ids.l10n_latam_move_check_ids_operation_date",
+        "payment_id.l10n_latam_move_check_ids_operation_date",
+    )
+    def _compute_current_journal(self):
+        super()._compute_current_journal()
+
     def button_open_check_operations(self):
         action = super(l10nLatamAccountPaymentCheck, self.sudo()).button_open_check_operations()
         self.ensure_one()
-        operations = self.operation_ids.sorted(lambda r: r.l10n_latam_move_check_ids_operation_date, reverse=True)
+        # Filtering comes first: a draft has no operation date yet, and sorting it against the
+        # confirmed ones compares None with a datetime.
         # A check can travel between companies of the same hierarchy (branches), so we keep every
         # operation of the tree instead of only the ones of the company the check currently is in.
-        operations = (operations + self.payment_id).filtered(
-            lambda x: x.state not in ["draft", "canceled"] and x.company_id.root_id == self.company_id.root_id
+        operations = (
+            (self.operation_ids + self.payment_id)
+            .filtered(
+                lambda x: x.state not in ["draft", "canceled"] and x.company_id.root_id == self.company_id.root_id
+            )
+            .sorted(lambda r: r.l10n_latam_move_check_ids_operation_date, reverse=True)
         )
         action = {
             "name": _("Check Operations"),
@@ -65,10 +88,12 @@ class l10nLatamAccountPaymentCheck(models.Model):
     def _get_last_operation(self):
         super()._get_last_operation()
         self.ensure_one()
+        # El desempate por id es necesario: sin el, dos operaciones con la misma fecha quedan en el
+        # orden en que las devolvio el recordset, que no es estable ni significativo.
         return (
             (self.payment_id + self.operation_ids)
             .filtered(lambda x: x.state not in ["draft", "canceled"] and x.l10n_latam_move_check_ids_operation_date)
-            .sorted(key=lambda payment: payment.l10n_latam_move_check_ids_operation_date)[-1:]
+            .sorted(key=lambda payment: (payment.l10n_latam_move_check_ids_operation_date, payment._origin.id))[-1:]
         )
 
     @api.depends("payment_method_line_id.code", "payment_id.partner_id")
@@ -85,8 +110,23 @@ class l10nLatamAccountPaymentCheck(models.Model):
         if payment_method_change or partner_id_change:
             super()._compute_issuer_vat()
 
+    @api.depends("outstanding_line_id.amount_residual")
     def _compute_issue_state(self):
+        """Solo los cheques propios tienen estado de emisión (tarea 70884).
+
+        Con una línea de liquidez por cheque los de terceros también tienen ``outstanding_line_id``,
+        así que un core anterior a odoo/odoo@d85e16a les daría un estado y entrarían al índice único
+        de arriba, donde el mismo número de dos libradores distintos es válido. Desde d85e16a base
+        filtra igual; esto queda para las imágenes con un core anterior.
+
+        El ``@api.depends`` no se puede sacar: el ORM lee las dependencias del método más derivado
+        del MRO. Efecto colateral pinneado por los tests ``_today``: un cheque propio en borrador
+        queda 'debited', porque su línea todavía no tiene residual.
+        """
         super()._compute_issue_state()
+        self.filtered(lambda r: r.payment_method_code != "own_checks").issue_state = False
+
+        # si la cuenta no es conciliable no queda nada por debitar
         for rec in self.filtered(lambda r: r.payment_method_code == "own_checks"):
             account = rec.outstanding_line_id.account_id
             if account and not account.reconcile:

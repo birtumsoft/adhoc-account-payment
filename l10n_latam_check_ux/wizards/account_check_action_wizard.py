@@ -41,15 +41,22 @@ class AccountCheckActionWizard(models.TransientModel):
                 "date": self.date,
             }
             # si existe account.reconcile.wizard (Enterprise)
-            if "account.reconcile.wizard" in self.env:
+            if self.sudo()._has_reconcile_wizard():
                 wizard = (
                     self.env["account.reconcile.wizard"]
                     .with_context(active_model="account.move.line", active_ids=move_line_id)
                     .create(new_mv_line_dicts)
                 )
                 wizard.reconcile()
+                # El label repite el número de cheque, que puede existir en más de una
+                # sucursal: sin el filtro de compañía el link podría apuntar al asiento de otra.
                 debit_move = self.env["account.move"].search(
-                    [("line_ids.name", "=", label), ("date", "=", self.date)], limit=1
+                    [
+                        ("line_ids.name", "=", label),
+                        ("date", "=", self.date),
+                        ("company_id", "=", check.company_id.id),
+                    ],
+                    limit=1,
                 )
             else:
                 amount = abs(sum(check.outstanding_line_id.mapped("balance")))
@@ -65,9 +72,9 @@ class AccountCheckActionWizard(models.TransientModel):
                             0,
                             {
                                 "name": label,
-                                "account_id": outstanding_account.id,
-                                "debit": amount if amount > 0 else 0.0,
-                                "credit": 0.0 if amount > 0 else -amount,
+                                "account_id": check.outstanding_line_id.account_id.id,
+                                "debit": amount,
+                                "credit": 0.0,
                                 "partner_id": check.partner_id.id,
                             },
                         ),
@@ -76,16 +83,16 @@ class AccountCheckActionWizard(models.TransientModel):
                             0,
                             {
                                 "name": label,
-                                "account_id": check.outstanding_line_id.account_id.id,
-                                "debit": 0.0 if amount > 0 else -amount,
-                                "credit": amount if amount > 0 else 0.0,
+                                "account_id": outstanding_account.id,
+                                "debit": 0.0,
+                                "credit": amount,
                                 "partner_id": check.partner_id.id,
                             },
                         ),
                     ],
                 }
                 debit_move = self.env["account.move"].create(move_vals)
-                debit_move.post()
+                debit_move.action_post()
                 lines_to_reconcile = check.outstanding_line_id | debit_move.line_ids.filtered(
                     lambda l: l.account_id == check.outstanding_line_id.account_id
                 )
@@ -99,6 +106,10 @@ class AccountCheckActionWizard(models.TransientModel):
                 check.message_post(
                     body=f'El cheque nro "{check.name}" ha sido debitado, pero no se encontró el asiento asociado.'
                 )
+
+    def _has_reconcile_wizard(self):
+        # account.reconcile.wizard only exists with account_accountant (Enterprise)
+        return "account.reconcile.wizard" in self.env
 
     def _get_outstanding_account(self, check):
         """Obtenemos la cuenta para hacer el débito de cheques y hacemos las validaciones correspondientes.

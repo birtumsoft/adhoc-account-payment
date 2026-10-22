@@ -419,3 +419,54 @@ class TestAccountPaymentProReceiptbookUnitTest(AccountTestInvoicingCommon):
         self.assertEqual(branch_rb.sequence_id.prefix, branch_rb.prefix)
         # Idempotent: a second run reassigns nothing.
         self.assertFalse(RB._resolve_branch_prefix_collisions())
+
+    def test_resync_shared_sequence_with_other_prefix(self):
+        """Receiptbooks sharing an ir.sequence resync to the highest number used by any of them,
+        read with the sequence prefix, even if a receiptbook has another prefix."""
+        self._enable_payment_accounts(self.company_bank_journal)
+        sequence = self.receiptbook.sequence_id
+        other_rb = self.env["account.payment.receiptbook"].create(
+            {
+                "name": "Shared sequence",
+                "partner_type": "customer",
+                "company_id": self.company.id,
+                "document_type_id": self.receiptbook.document_type_id.id,
+                "prefix": "001-",
+                "sequence_id": sequence.id,
+            }
+        )
+        self.assertEqual(other_rb.sequence_id, sequence)
+        self._post_receipt()
+        self._post_receipt(other_rb)
+        self._post_receipt()
+        self._post_receipt(other_rb)
+        expected_next = sequence.number_next_actual
+
+        for receiptbooks in (self.receiptbook | other_rb, other_rb, self.receiptbook):
+            sequence.number_next = 1
+            receiptbooks.action_resync_sequence()
+            self.assertEqual(sequence.number_next_actual, expected_next)
+
+    def test_skipped_canceled_payment_does_not_take_a_receipt_number(self):
+        """Posting a selection with a canceled payment numbers only the draft."""
+        vals = {
+            "amount": 100,
+            "payment_type": "inbound",
+            "partner_id": self.partner_ri.id,
+            "journal_id": self.company_bank_journal.id,
+            "date": self.today,
+            "company_id": self.company.id,
+            "receiptbook_id": self.receiptbook.id,
+        }
+        draft = self.env["account.payment"].create(vals)
+        canceled = self.env["account.payment"].create(vals)
+        canceled.action_cancel()
+        sequence = self.receiptbook.with_context(ir_sequence_date=self.today).sequence_id
+        number_next = sequence.number_next_actual
+
+        (draft | canceled).action_post()
+
+        sequence.invalidate_recordset(["number_next_actual"])
+        self.assertEqual(sequence.number_next_actual, number_next + 1)
+        self.assertEqual(canceled.state, "canceled")
+        self.assertIn(canceled.name, (False, "/"))

@@ -1,15 +1,16 @@
 from datetime import timedelta
 
-from odoo import api, fields, models
+from odoo import Command, _, api, fields, models
 from odoo.exceptions import ValidationError
 
 
 class AccountPayment(models.Model):
     _inherit = "account.payment"
 
+    # No default on purpose: this field means "when this operation was confirmed", so it stays
+    # empty while the payment is a draft and it is filled on the first action_post().
     l10n_latam_move_check_ids_operation_date = fields.Datetime(
         string="Operation Date",
-        default=fields.Datetime.now(),
     )
 
     @api.constrains("l10n_latam_move_check_ids_operation_date", "state")
@@ -40,7 +41,16 @@ class AccountPayment(models.Model):
         for rec in self:
             if rec.l10n_latam_check_warning_msg:
                 raise ValidationError("%s" % rec.l10n_latam_check_warning_msg)
-            rec.l10n_latam_move_check_ids_operation_date = rec.create_date if rec.create_date else fields.Datetime.now()
+            # The chain of a check is the order in which its operations were confirmed, not the
+            # order in which they were created: a payment order left in draft for a few days and
+            # confirmed last belongs at the end of the chain, otherwise the check it hands over
+            # keeps showing as available in the portfolio.
+            # Recomputing it on every confirmation does not reorder anything, because action_draft
+            # only lets the last operation of the chain go back to draft.
+            # action_post can also run on payments that are already confirmed (e.g. the list view
+            # confirm action), so only drafts get a new date.
+            if rec.state == "draft":
+                rec.l10n_latam_move_check_ids_operation_date = rec._get_check_operation_date()
 
         # Detectar cheques de terceros existentes usados más de una vez dentro del mismo
         # batch de confirmación (ej: bundle confirma dos pagos hijos en draft que tienen
@@ -55,7 +65,58 @@ class AccountPayment(models.Model):
                 )
             seen |= rec.l10n_latam_move_check_ids
 
-        super().action_post()
+        # The core unlinks the checks of payments whose method is not for checks, and a bank journal
+        # cannot have a checks method. The inbound leg of a check transfer (its paired payment moves
+        # the same checks) keeps them anyway, on every confirmation and not only on the wizard one.
+        # A payment that kept stale checks after a method change has no such paired payment.
+        # The inbound legs go last: posting one moves the check to its journal, and an outbound leg
+        # posted in the same batch would then fail its "check still in journal" validation.
+        inbound_legs = self.filtered(
+            lambda x: (
+                x.payment_type == "inbound"
+                and x.l10n_latam_move_check_ids
+                and x.l10n_latam_move_check_ids == x.paired_internal_transfer_payment_id.l10n_latam_move_check_ids
+            )
+        )
+        others = self - inbound_legs
+        if others:
+            super(AccountPayment, others).action_post()
+        if inbound_legs:
+            super(AccountPayment, inbound_legs.with_context(l10n_ar_skip_remove_check=True)).action_post()
+
+    def _get_check_operation_date(self):
+        """Confirmation date that leaves this payment last in the chain of its checks.
+
+        The date has second precision, so two confirmations in the same second tie, and the id
+        tie-break follows the creation order: a payment order drafted before the receipt would land
+        first again. Pushing it one second past the last confirmed operation keeps the chain strict.
+        """
+        self.ensure_one()
+        operation_date = fields.Datetime.now()
+        for check in self.l10n_latam_move_check_ids | self.l10n_latam_new_check_ids:
+            last_operation_date = check._get_last_operation().l10n_latam_move_check_ids_operation_date
+            if last_operation_date:
+                operation_date = max(operation_date, last_operation_date + timedelta(seconds=1))
+        return operation_date
+
+    def _is_check_transfer(self):
+        return self.payment_method_code in ("out_third_party_checks", "return_third_party_checks")
+
+    @api.depends("payment_method_line_id")
+    def _compute_available_destination_payment_method_line_ids(self):
+        super()._compute_available_destination_payment_method_line_ids()
+        for pay in self.filtered("available_destination_payment_method_line_ids"):
+            if pay._is_check_transfer():
+                pay.available_destination_payment_method_line_ids = (
+                    pay.destination_journal_id._get_check_transfer_destination_lines()
+                )
+            else:
+                # a transfer never brings new checks: with that line the paired payment ends up with amount 0
+                pay.available_destination_payment_method_line_ids = (
+                    pay.available_destination_payment_method_line_ids.filtered(
+                        lambda x: x.code != "new_third_party_checks"
+                    )
+                )
 
     def _create_paired_internal_transfer_payment(self):
         """
@@ -99,20 +160,15 @@ class AccountPayment(models.Model):
                         ),
                     )._create_paired_internal_transfer_payment()
 
-                # The outbound must have a greater operation_date than the inbound so it is
-                # identified as the latest operation. Subtract 1s from the inbound payment.
+                # The paired payment is created with copy() and posted without action_post(), so it
+                # inherits this operation date and the id tie-break leaves it last. That is right
+                # when this payment is the outbound side. When it is the inbound side, the check
+                # ends up in this journal, so this payment has to be the last operation.
                 if rec.payment_type == "inbound":
                     rec.write(
                         {
                             "l10n_latam_move_check_ids_operation_date": rec.l10n_latam_move_check_ids_operation_date
                             + timedelta(minutes=1)
-                        }
-                    )
-                else:
-                    rec.write(
-                        {
-                            "l10n_latam_move_check_ids_operation_date": rec.l10n_latam_move_check_ids_operation_date
-                            - timedelta(minutes=1)
                         }
                     )
                 rec._get_latam_checks()._compute_current_journal()
@@ -121,8 +177,11 @@ class AccountPayment(models.Model):
                 # If the journal belongs to the third-party checks journal, posting the move was incorrectly removing the checks,
                 # even though the payment method line is for checks.
                 # To fix this, we replicate the same behavior as in Odoo's "transfer check" wizard by setting the proper payment method.
-                correct_dest_payment_method = rec.destination_journal_id.inbound_payment_method_line_ids.filtered(
-                    lambda x: x.code == "in_third_party_checks"
+                # An explicit choice by the user wins over this default.
+                correct_dest_payment_method = rec.destination_payment_method_line_id or (
+                    rec.destination_journal_id.inbound_payment_method_line_ids.filtered(
+                        lambda x: x.code == "in_third_party_checks"
+                    )
                 )
                 if correct_dest_payment_method:
                     rec.paired_internal_transfer_payment_id.payment_method_line_id = correct_dest_payment_method
@@ -214,6 +273,72 @@ class AccountPayment(models.Model):
                     "All selected checks must belong to the source journal (%s)."
                     % rec.destination_journal_id.display_name
                 )
+
+    def _l10n_latam_check_liquidity_lines(self):
+        """Una línea de liquidez por cheque, con su nominal, su vencimiento y su link.
+
+        Cubre lo que `l10n_latam_check` no hace: un core anterior a odoo/odoo@d85e16a arma una sola
+        línea, y uno posterior no vincula los cheques de terceros, que acá siguen vinculados porque
+        `outstanding_line_id` lo leen reportes y wizards. El balance queda a la cotización del pago;
+        la revaluación de `_prepare_move_liquidity_lines` lo ajusta a la del asiento.
+        """
+        check_suffix = "".join([item[1] for item in self._get_aml_default_display_name_list()])
+        line_common_vals = {
+            "currency_id": self.currency_id.id,
+            "partner_id": self.partner_id.id,
+            "account_id": self.outstanding_account_id.id,
+        }
+        liquidity_vals = []
+        for check in self.l10n_latam_new_check_ids | self.l10n_latam_move_check_ids:
+            liquidity_amount = check.amount if self.payment_type == "inbound" else -check.amount
+            liquidity_vals.append(
+                {
+                    "name": _("Check %(check_number)s - %(suffix)s", check_number=check.name, suffix=check_suffix),
+                    "date_maturity": check.payment_date,
+                    "amount_currency": liquidity_amount,
+                    "balance": self.currency_id._convert(
+                        liquidity_amount, self.company_currency_id, self.company_id, self.date
+                    ),
+                    "l10n_latam_check_ids": [Command.set(check.ids)],
+                    **line_common_vals,
+                }
+            )
+        return liquidity_vals
+
+    def _l10n_latam_check_split_move(self):
+        """No-op: las líneas de liquidez de arriba reemplazan al split move.
+
+        Se mantiene para la comunidad, por si usan un core anterior a odoo/odoo@d85e16a. En Adhoc no
+        hace falta. Borrar en 20.0.
+        """
+        return
+
+    def _l10n_latam_check_unlink_split_move(self):
+        """Reemplaza al core sin llamar a super.
+
+        El core le borra ``outstanding_line_id`` al cheque cuya línea está en el asiento del pago, y
+        con una línea por cheque esa es siempre su línea: al volver a confirmar quedaría desvinculado.
+        Acá se conserva. Lo único que se desarma es el split move de los pagos confirmados con el
+        esquema anterior, que si no queda confirmado y huérfano con el importe en la cuenta outstanding.
+        """
+        self.ensure_one()
+        for check in self.l10n_latam_new_check_ids:
+            if not check.outstanding_line_id or self.move_id == check.outstanding_line_id.move_id:
+                continue
+            check.outstanding_line_id.move_id.button_draft()
+            check.outstanding_line_id.move_id.unlink()
+
+    def _synchronize_to_moves(self, changed_fields):
+        """Base bloquea escribir ``amount`` cuando el asiento tiene más de una línea de liquidez, y
+        los pagos con cheques tienen una por cheque: se saca del set y el mapeo lo sigue haciendo
+        base. Si ``amount`` es el único campo escrito no se re-sincroniza nada, inocuo porque se
+        recalcula desde los cheques."""
+        with_checks = self.filtered(lambda x: x.l10n_latam_new_check_ids or x.l10n_latam_move_check_ids)
+        super(AccountPayment, self - with_checks)._synchronize_to_moves(changed_fields)
+        if with_checks:
+            super(AccountPayment, with_checks)._synchronize_to_moves(
+                tuple(field for field in changed_fields if field != "amount")
+            )
 
     def _prepare_paired_payment_values(self):
         """Override to validate check payment method combinations on internal transfers.
@@ -339,15 +464,19 @@ class AccountPayment(models.Model):
         Se deduce en vez de llamar a `_convert` por línea justamente para honrar el balance que llegó,
         venga de la fecha del pago o forzado, y para no pagar una consulta de cotización por cheque.
 
-        El origen está en `l10n_latam_check._prepare_move_liquidity_lines`, que NO es código de
-        odoo/odoo 19.0: llega por el PR odoo#248741 (abierto, de Adhoc) que nuestra imagen mergea.
-        El arreglo definitivo va ahí; mientras ese PR siga abierto, esto lo cubre desde afuera. Ojo al
-        limpiarlo: el día que el origen respete el balance que entrega, esto queda inocuo pero sigue
-        decidiendo dónde cae el resto del redondeo, así que no es un borrado a ciegas.
+        El origen está en `l10n_latam_check._prepare_move_liquidity_lines`, que entró a odoo/odoo
+        19.0 con d85e16a y sigue convirtiendo por la fecha de cada cheque. Ojo al limpiarlo: el día
+        que el origen respete el balance que entrega, esto queda inocuo pero sigue decidiendo dónde
+        cae el resto del redondeo, así que no es un borrado a ciegas.
         """
         lines = super()._prepare_move_liquidity_lines(default_values)
-        if not lines[0].get("l10n_latam_check_ids") or not self.amount:
-            # no las armó `l10n_latam_check`: no hay una línea por cheque que revaluar
+        checks = self.l10n_latam_new_check_ids | self.l10n_latam_move_check_ids
+        if not checks:
+            return lines
+        if len(lines) != len(checks) or not all(line.get("l10n_latam_check_ids") for line in lines):
+            # core anterior a d85e16a (una sola línea) o cheques de terceros sin vincular
+            lines = self._l10n_latam_check_liquidity_lines()
+        if not self.amount:
             return lines
 
         balance = default_values["balance"]
